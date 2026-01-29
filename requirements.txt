@@ -1,0 +1,17 @@
+streamlit
+langchain
+langchain-community
+langchain-openai
+langchain-groq
+chromadb
+pypdf2
+python-docx
+pandas
+openpyxl
+tiktoken
+sentence-transformers
+torch
+langchain-chroma
+langchain-huggingface
+cohere
+langchain-cohere
