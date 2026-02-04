@@ -1,12 +1,12 @@
 import streamlit as st
 from datetime import datetime
 from dotenv import load_dotenv
-
+from mcp_client import MCPClient 
 from loaders import FileLoader
 from textprocessing import TextProcessor
 from vectorstore import VectorStore
-from llm import LLMManager
-
+from db_service import save_document
+# ---------------- Load ENV ----------------
 load_dotenv(override=True)
 
 # ---------------- Page Config ----------------
@@ -17,41 +17,62 @@ st.set_page_config(
 
 st.title("📄 Talk to Your Docs")
 
-# ---------------- Initialize Modules ----------------
+# ---------------- Constants ----------------
+MAX_TOP_DOCS = 3
+
+# ---------------- Initialize Components ----------------
 file_loader = FileLoader()
 text_processor = TextProcessor()
-llm_manager = LLMManager()
+mcp_client = MCPClient()
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_vectorstore():
     return VectorStore()
-
 vectorstore = get_vectorstore()
 
-# ---------------- File Upload ----------------
-st.sidebar.header("Upload Documents")
 
-uploaded_files = st.sidebar.file_uploader(
-    "Upload PDF, DOCX, CSV, XLSX",
+
+# ---------------- File Upload ----------------
+st.sidebar.header("📤 Upload Documents")
+
+uploaded_files = st.file_uploader(
+    "Upload PDF / DOCX / CSV / XLSX",
     type=["pdf", "docx", "csv", "xlsx"],
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    with st.spinner("Indexing documents..."):
-        for file in uploaded_files:
-            text = file_loader.load(file)
+    with st.spinner("Uploading and indexing documents..."):
+        for uploaded_file in uploaded_files:
 
-            if text.strip():
-                docs = text_processor.process(text, file.name)
+            # 1️⃣ Upload to MCP (filesystem simulation)
+            file_id = mcp_client.upload_file(uploaded_file)
+            if not file_id:
+                st.warning(f"Failed to upload {uploaded_file.name}")
+                continue
 
-                upload_time = datetime.now().isoformat()
-                for doc in docs:
-                    doc.metadata["upload_date"] = upload_time
+            # 2️⃣ Load file content
+            text = file_loader.load(uploaded_file)
+            if not text.strip():
+                continue
 
-                vectorstore.add_documents(docs)
+            # 3️⃣ Process text into document chunks
+            docs = text_processor.process(text, uploaded_file.name)
 
-    st.sidebar.success("✅ Documents indexed successfully")
+            upload_time = datetime.now().isoformat()
+            for doc in docs:
+                # Add metadata
+                doc.metadata["upload_date"] = upload_time
+                doc.metadata["filename"] = uploaded_file.name
+                doc.metadata["file_id"] = file_id
+
+                # 4️⃣ Save to MCP SQLite
+                save_document(doc.page_content, doc.metadata)
+
+            # 5️⃣ Add documents to vectorstore
+            vectorstore.add_documents(docs)
+
+    st.sidebar.success("✅ Files uploaded, indexed, and saved to MCP successfully!")
 
 # ---------------- Chat Section ----------------
 st.header("💬 Chat with your documents")
@@ -59,63 +80,39 @@ st.header("💬 Chat with your documents")
 query = st.text_input("Ask a question from the uploaded documents:")
 
 if query and query.strip():
+    with st.spinner("Generating answer..."):
 
-    # -------- Query Expansion --------
-    queries = llm_manager.expand_query(query)
+        # 1️⃣ Retrieval: similarity search on vectorstore
+        top_docs = vectorstore.similarity_search(query=query, k=MAX_TOP_DOCS)
 
-    st.subheader("🔍 Queries Used")
-    for i, q in enumerate(queries, 1):
-        st.write(f"{i}. {q}")
+        if not top_docs:
+            st.warning("No relevant documents found.")
+            st.stop()
 
-    # -------- Retrieval --------
-    retrieved_docs = []
-    for q in queries:
-        retrieved_docs.extend(
-            vectorstore.similarity_search(q, k=6)
-        )
+        best_doc = top_docs[1]
 
-    if not retrieved_docs:
-        st.warning("No relevant documents found.")
-        st.stop()
+        # 3️⃣ Generate ONE clean answer
+        answer = mcp_client.generate_answer(query, [best_doc])
 
-    # Remove duplicate documents
-    unique_docs = {
-        doc.page_content: doc for doc in retrieved_docs
-    }.values()
-
-    # -------- Rerank --------
-    top_docs = vectorstore.rerank(
-        documents=list(unique_docs),
-        query=query,
-        top_n=5
-    )
-
-    # -------- Answer --------
-    answer = llm_manager.generate_answer(
-        query=query,
-        documents=top_docs
-    )
-
+    # ---------------- Display Answer ----------------
     st.subheader("Answer")
-    st.write(answer)
+    st.markdown(f"💡 **{answer}**")
 
     # -------- Sources --------
-    st.subheader("Sources")
-    from datetime import datetime
+    st.subheader(" Sources")
+    for doc in [best_doc]:
+        upload_date_str = doc.metadata.get("upload_date", "")
+        filename = doc.metadata.get("filename", "Unknown")
 
-for doc in top_docs:
-    upload_date_str = doc.metadata.get("upload_date", "")
+        try:
+            upload_date = datetime.fromisoformat(upload_date_str)
+            formatted_date = upload_date.strftime("%d %b %Y, %I:%M %p")
+        except Exception:
+            formatted_date = upload_date_str
 
-    try:
-        upload_date = datetime.fromisoformat(upload_date_str)
+        st.markdown(
+            f"- **File:** {filename} | **Uploaded:** {formatted_date}"
+        )
 
-        formatted_date = upload_date.strftime("%d %b %Y, %I:%M %p")
-    except Exception:
-        formatted_date = upload_date_str  # fallback if parsing fails
-
-    st.markdown(
-        f"- **File:** {doc.metadata.get('filename', 'Unknown')} | "
-        f"**Upload Date:** {formatted_date}"
-    )
 else:
-    st.info("Enter a question to chat with your documents.")
+    st.info(" Upload documents and ask a question to get started.")
