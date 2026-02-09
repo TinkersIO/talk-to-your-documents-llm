@@ -1,118 +1,151 @@
-import streamlit as st
+import os
+import asyncio
+import atexit
 from datetime import datetime
+import streamlit as st
 from dotenv import load_dotenv
-from mcp_client import MCPClient 
-from loaders import FileLoader
-from textprocessing import TextProcessor
-from vectorstore import VectorStore
-from db_service import save_document
+import base64
+
+# ---------------- MCP Client ----------------
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_groq import ChatGroq
+
 # ---------------- Load ENV ----------------
 load_dotenv(override=True)
 
-# ---------------- Page Config ----------------
-st.set_page_config(
-    page_title="Talk To My Docs",
-    layout="wide"
-)
+# ---------------- MCP Servers ----------------
+MCP_SERVERS = {
+    "filesystem": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "./uploads"],
+    },
+    "sqlite": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@executeautomation/database-server", "./database.db"],
+    },
+}
 
+# ---------------- MCP Client Wrapper ----------------
+class MCPClient:
+    """Simple MCP client with async filesystem + SQLite operations."""
+    def __init__(self):
+        self.mcp = MultiServerMCPClient(MCP_SERVERS)
+        self.tools = {}
+        self.llm = ChatGroq(
+            api_key=os.getenv("GROQ_API_KEY"),
+            model="llama-3.1-8b-instant",
+            temperature=0,
+        )
+
+    async def init_tools(self):
+        if not self.tools:
+            tools_list = await self.mcp.get_tools()
+            self.tools = {t.name: t for t in tools_list}
+
+    async def get_tool(self, name):
+        await self.init_tools()
+        tool = self.tools.get(name)
+        if not tool:
+            raise ValueError(f"Tool '{name}' not found. Available: {list(self.tools.keys())}")
+        return tool
+
+    # ---------------- Filesystem ----------------
+    async def upload_file(self, filename, content: bytes):
+        write_file = await self.get_tool("write_file")
+
+        # Ensure uploads folder exists
+        os.makedirs("uploads", exist_ok=True)
+
+        # Only filename, MCP sandbox requires relative path inside ./uploads
+        safe_filename = os.path.basename(filename)
+        mcp_path = f"uploads/{safe_filename}"
+
+        encoded = base64.b64encode(content).decode("utf-8")
+        await write_file.arun({
+            "path": mcp_path,
+            "content": encoded,
+            "encoding": "base64"
+        })
+        return mcp_path
+
+    async def read_file(self, filename):
+        read_file = await self.get_tool("read_file")
+        result = await read_file.arun({"path": filename})
+        return base64.b64decode(result["content"])
+
+    # ---------------- LLM ----------------
+    async def generate_answer(self, query: str, docs: list):
+        context = "\n\n".join(doc["page_content"] for doc in docs)
+        prompt = f"""
+Answer the question using the context below.
+- Be concise (3-4 sentences max)
+- Do NOT repeat the question
+
+Context:
+{context}
+
+Question:
+{query}
+"""
+        response = self.llm.invoke(prompt)
+        return response.content.strip()
+
+    # ---------------- Cleanup ----------------
+    async def close(self):
+        await self.mcp.close()
+
+
+# ---------------- Async helper ----------------
+def run_async(coro):
+    return asyncio.run(coro)
+
+
+# ---------------- Streamlit App ----------------
+st.set_page_config(page_title="📄 Talk To My Docs", layout="wide")
 st.title("📄 Talk to Your Docs")
 
-# ---------------- Constants ----------------
-MAX_TOP_DOCS = 3
-
-# ---------------- Initialize Components ----------------
-file_loader = FileLoader()
-text_processor = TextProcessor()
 mcp_client = MCPClient()
 
-@st.cache_resource
-def get_vectorstore():
-    return VectorStore()
-vectorstore = get_vectorstore()
+# Ensure MCP servers close on exit
+atexit.register(lambda: asyncio.get_event_loop().run_until_complete(mcp_client.close()))
 
-
-
-# ---------------- File Upload ----------------
+# ---------------- Sidebar: Upload ----------------
 st.sidebar.header("📤 Upload Documents")
-
-uploaded_files = st.file_uploader(
+uploaded_files = st.sidebar.file_uploader(
     "Upload PDF / DOCX / CSV / XLSX",
     type=["pdf", "docx", "csv", "xlsx"],
     accept_multiple_files=True
 )
 
+# Keep track of uploaded docs for LLM context
+uploaded_docs = []
+
 if uploaded_files:
-    with st.spinner("Uploading and indexing documents..."):
-        for uploaded_file in uploaded_files:
-
-            # 1️⃣ Upload to MCP (filesystem simulation)
-            file_id = mcp_client.upload_file(uploaded_file)
-            if not file_id:
-                st.warning(f"Failed to upload {uploaded_file.name}")
-                continue
-
-            # 2️⃣ Load file content
-            text = file_loader.load(uploaded_file)
-            if not text.strip():
-                continue
-
-            # 3️⃣ Process text into document chunks
-            docs = text_processor.process(text, uploaded_file.name)
-
-            upload_time = datetime.now().isoformat()
-            for doc in docs:
-                # Add metadata
-                doc.metadata["upload_date"] = upload_time
-                doc.metadata["filename"] = uploaded_file.name
-                doc.metadata["file_id"] = file_id
-
-                # 4️⃣ Save to MCP SQLite
-                save_document(doc.page_content, doc.metadata)
-
-            # 5️⃣ Add documents to vectorstore
-            vectorstore.add_documents(docs)
-
-    st.sidebar.success("✅ Files uploaded, indexed, and saved to MCP successfully!")
+    with st.spinner("Uploading and indexing files..."):
+        for file in uploaded_files:
+            content = file.getvalue()
+            # Upload file inside ./uploads via MCP
+            file_id = run_async(mcp_client.upload_file(file.name, content))
+            # Add to context for demo purposes
+            uploaded_docs.append({
+                "page_content": f"File: {file.name}",
+                "file_id": file_id
+            })
+    st.sidebar.success("✅ Files uploaded successfully!")
 
 # ---------------- Chat Section ----------------
 st.header("💬 Chat with your documents")
+query = st.text_input("Ask a question:")
 
-query = st.text_input("Ask a question from the uploaded documents:")
+if query.strip():
+    if not uploaded_docs:
+        st.warning("Please upload documents first.")
+    else:
+        with st.spinner("Generating answer..."):
+            answer = run_async(mcp_client.generate_answer(query, uploaded_docs))
+        st.subheader("Answer")
+        st.markdown(f"💡 {answer}")
 
-if query and query.strip():
-    with st.spinner("Generating answer..."):
 
-        # 1️⃣ Retrieval: similarity search on vectorstore
-        top_docs = vectorstore.similarity_search(query=query, k=MAX_TOP_DOCS)
-
-        if not top_docs:
-            st.warning("No relevant documents found.")
-            st.stop()
-
-        best_doc = top_docs[1]
-
-        # 3️⃣ Generate ONE clean answer
-        answer = mcp_client.generate_answer(query, [best_doc])
-
-    # ---------------- Display Answer ----------------
-    st.subheader("Answer")
-    st.markdown(f"💡 **{answer}**")
-
-    # -------- Sources --------
-    st.subheader(" Sources")
-    for doc in [best_doc]:
-        upload_date_str = doc.metadata.get("upload_date", "")
-        filename = doc.metadata.get("filename", "Unknown")
-
-        try:
-            upload_date = datetime.fromisoformat(upload_date_str)
-            formatted_date = upload_date.strftime("%d %b %Y, %I:%M %p")
-        except Exception:
-            formatted_date = upload_date_str
-
-        st.markdown(
-            f"- **File:** {filename} | **Uploaded:** {formatted_date}"
-        )
-
-else:
-    st.info(" Upload documents and ask a question to get started.")
