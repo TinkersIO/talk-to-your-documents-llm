@@ -1,15 +1,12 @@
 import os
 import asyncio
-import cohere
 import atexit
 import PyPDF2
-import time
 from datetime import datetime
 import streamlit as st
 from dotenv import load_dotenv
-import base64
-from cohere import Client
 
+load_dotenv(override=True) 
 # ---------------- MCP Client ----------------
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -19,52 +16,6 @@ from textprocessing import TextProcessor
 from vectorstore import VectorStore
 from llm import LLMManager
 from langchain_core.documents import Document
-
-# ---------------- Load ENV ----------------
-load_dotenv(override=True)
-client = Client(os.getenv("COHERE_API_KEY"))
-
-# ---------------- Rate Limiting ----------------
-CALLS_PER_MINUTE = 100
-TIME_WINDOW = 60
-
-
-class APIClient:
-    def __init__(self):
-        self.api_calls = 0
-        self.start_time = time.time()
-
-    def reset_calls(self):
-        if time.time() - self.start_time >= TIME_WINDOW:
-            self.api_calls = 0
-            self.start_time = time.time()
-
-    def rate_limit(self):
-        self.reset_calls()
-        if self.api_calls >= CALLS_PER_MINUTE:
-            time.sleep(TIME_WINDOW)
-            self.api_calls = 0
-
-    def call_api(self, texts):
-        self.rate_limit()
-
-        try:
-            self.api_calls += 1
-
-            response = client.embed(
-            texts=texts,
-            model="embed-english-v3.0"
-            )
-
-            return response.embeddings
-
-        except cohere.errors.TooManyRequestsError:
-            print("Rate limit exceeded. Retrying...")
-            time.sleep(60)
-            return self.call_api(texts)
-
-
-api_client = APIClient()
 
 # ---------------- MCP Servers ----------------
 MCP_SERVERS = {
@@ -98,6 +49,7 @@ class MCPClient:
     # ---------- Filesystem MCP ----------
     async def upload_file(self, filename, content: bytes):
         write_file = await self.get_tool("write_file")
+        import base64
         encoded = base64.b64encode(content).decode("utf-8")
         path = f"uploads/{os.path.basename(filename)}"
         await write_file.arun({
@@ -132,26 +84,46 @@ def run_async(coro):
 st.set_page_config(page_title="📄 Talk To My Docs", layout="wide")
 st.title("📄 Talk to Your Documents")
 
-# ---------------- Session State ----------------
-if "uploaded_docs" not in st.session_state:
-    st.session_state.uploaded_docs = []
-
 # ---------------- Init Components ----------------
 mcp_client = MCPClient()
 file_loader = FileLoader()
 text_processor = TextProcessor()
-vectorstore = VectorStore()
-llm_manager = LLMManager()
+vectorstore = VectorStore()  # <-- Local Qdrant + embeddings
+llm = LLMManager()
+
+# ---------------- Session State ----------------
+if "uploaded_docs" not in st.session_state:
+    st.session_state.uploaded_docs = []
 
 atexit.register(lambda: asyncio.get_event_loop().run_until_complete(mcp_client.close()))
 
-# ---------------- Embed Helper ----------------
-def process_documents_and_embed(docs):
-    texts = [d["content"] for d in docs]
-    embeddings = api_client.call_api(texts)
-    for emb, doc in zip(embeddings, docs):
-        doc["embedding"] = emb
-    return docs
+
+# ---------------- Helpers ----------------
+def chunk_text(text, chunk_size=500, overlap=50):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
+    return chunks
+
+
+def process_documents_and_add_to_vectorstore(documents):
+    all_docs = []
+    for doc in documents:
+        chunks = chunk_text(doc["content"])
+        for chunk in chunks:
+            processed_chunk = Document(
+                page_content=chunk,
+                metadata={"filename": doc["filename"], "mcp_path": doc["mcp_path"]}
+            )
+            all_docs.append(processed_chunk)
+
+    # Add all chunks to vectorstore
+    if all_docs:
+        vectorstore.add_documents(all_docs)
+    return all_docs
 
 
 # ---------------- Sidebar Upload ----------------
@@ -168,7 +140,6 @@ if uploaded_files:
     with st.spinner("Uploading, processing and indexing documents..."):
         for file in uploaded_files:
             content = ""
-
             if file.type == "application/pdf":
                 reader = PyPDF2.PdfReader(file)
                 for page in reader.pages:
@@ -194,8 +165,8 @@ if uploaded_files:
                 "mcp_path": mcp_path
             })
 
-        process_documents_and_embed(st.session_state.uploaded_docs)
-        st.sidebar.success("✅ Documents uploaded & processed successfully!")
+        process_documents_and_add_to_vectorstore(st.session_state.uploaded_docs)
+        st.sidebar.success("✅ Documents uploaded & indexed successfully!")
 
 
 # ---------------- Chat Section ----------------
@@ -207,15 +178,23 @@ if query and query.strip():
         st.warning("Please upload documents first.")
     else:
         with st.spinner("Searching documents..."):
-            top_docs = st.session_state.uploaded_docs[:3]
-            answer = "This is a simulated answer based on the documents provided."
+            # Retrieve top 3 most relevant chunks from vectorstore
+            top_docs = vectorstore.similarity_search(query, k=3)
+
+            # Assemble context for LLM
+            context = "\n\n".join(
+                f"[Source: {r.metadata.get('filename', 'Unknown')}]\n{r.page_content}"
+                for r in top_docs
+            )
+
+            # Generate answer
+            answer = llm.generate_answer(query, context)
 
         st.subheader("Answer")
         st.markdown(f"💡 **{answer}**")
 
         st.subheader("Sources")
         for doc in top_docs:
-            st.markdown(f"- **{doc['filename']}**")
-
+            st.markdown(f"- **{doc.metadata.get('filename', 'unknown')}**")
 else:
     st.info("📤 Upload documents and ask a question to get started.")
