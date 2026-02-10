@@ -1,200 +1,148 @@
 import os
 import asyncio
-import atexit
-import PyPDF2
 from datetime import datetime
+import base64
 import streamlit as st
 from dotenv import load_dotenv
-
-load_dotenv(override=True) 
-# ---------------- MCP Client ----------------
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-# ---------------- Local Modules ----------------
-from loaders import FileLoader
-from textprocessing import TextProcessor
-from vectorstore import VectorStore
+from PyPDF2 import PdfReader
+from langchain_core.tools import Tool
+from mcp_client import load_mcp_tools, upload_file_via_mcp, save_metadata_via_mcp
 from llm import LLMManager
-from langchain_core.documents import Document
+from vectorstore import VectorStore
+from textprocessing import TextProcessor
 
-# ---------------- MCP Servers ----------------
-MCP_SERVERS = {
-    "filesystem": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-filesystem", "./uploads"],
-    },
-    "sqlite": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@executeautomation/database-server", "./database.db"],
-    },
-}
+load_dotenv(override=True)
 
+# ---------------- Helpers ----------------
 
-class MCPClient:
-    def __init__(self):
-        self.mcp = MultiServerMCPClient(MCP_SERVERS)
-        self.tools = {}
+def extract_text_from_pdf(file) -> str:
+    reader = PdfReader(file)
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
-    async def init_tools(self):
-        if not self.tools:
-            tools = await self.mcp.get_tools()
-            self.tools = {t.name: t for t in tools}
+async def process_upload(file, write_tool: Tool, sql_tool: Tool):
+    """Uploads a single file and saves its metadata."""
+    if file.type == "application/pdf":
+        content = extract_text_from_pdf(file).encode("utf-8")
+    else:
+        content = file.getvalue()
 
-    async def get_tool(self, name):
-        await self.init_tools()
-        return self.tools[name]
+    await upload_file_via_mcp(write_tool, file.name, content)
 
-    # ---------- Filesystem MCP ----------
-    async def upload_file(self, filename, content: bytes):
-        write_file = await self.get_tool("write_file")
-        import base64
-        encoded = base64.b64encode(content).decode("utf-8")
-        path = f"uploads/{os.path.basename(filename)}"
-        await write_file.arun({
-            "path": path,
-            "content": encoded,
-            "encoding": "base64"
-        })
-        return path
+    
+    await save_metadata_via_mcp(sql_tool, file.name, "User uploaded")
 
-    # ---------- SQLite MCP (INSERT ONLY) ----------
-    async def save_metadata(self, metadata: dict):
-        write_query = await self.get_tool("write_query")
-        sql = f"""
-        INSERT INTO documents (filename, upload_date, metadata)
-        VALUES (
-            '{metadata["filename"]}',
-            '{metadata["upload_date"]}',
-            '{metadata["metadata"]}'
-        );
-        """
-        await write_query.arun({"query": sql})
+    return {"filename": file.name, "content": content.decode("utf-8", errors="ignore")}
 
-    async def close(self):
-        await self.mcp.close()
+# ---------------- Streamlit Setup ----------------
 
-
-def run_async(coro):
-    return asyncio.run(coro)
-
-
-# ---------------- Streamlit App ----------------
 st.set_page_config(page_title="📄 Talk To My Docs", layout="wide")
 st.title("📄 Talk to Your Documents")
 
-# ---------------- Init Components ----------------
-mcp_client = MCPClient()
-file_loader = FileLoader()
-text_processor = TextProcessor()
-vectorstore = VectorStore()  # <-- Local Qdrant + embeddings
-llm = LLMManager()
+vectorstore = VectorStore()
+llm_manager = LLMManager()
+
+# ---------------- MCP Setup ----------------
+
+mcp_client, mcp_tools = load_mcp_tools()
+
+write_file_tool = next((t for t in mcp_tools if t.name == "write_file"), None)
+read_file_tool = next((t for t in mcp_tools if t.name == "read_file"), None)
+write_query_tool = next((t for t in mcp_tools if t.name == "write_query"), None)
+
+if not all([write_file_tool, read_file_tool, write_query_tool]):
+    st.error("MCP tools not loaded correctly.")
+    st.stop()
 
 # ---------------- Session State ----------------
+
 if "uploaded_docs" not in st.session_state:
     st.session_state.uploaded_docs = []
 
-atexit.register(lambda: asyncio.get_event_loop().run_until_complete(mcp_client.close()))
-
-
-# ---------------- Helpers ----------------
-def chunk_text(text, chunk_size=500, overlap=50):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start = end - overlap
-    return chunks
-
-
-def process_documents_and_add_to_vectorstore(documents):
-    all_docs = []
-    for doc in documents:
-        chunks = chunk_text(doc["content"])
-        for chunk in chunks:
-            processed_chunk = Document(
-                page_content=chunk,
-                metadata={"filename": doc["filename"], "mcp_path": doc["mcp_path"]}
-            )
-            all_docs.append(processed_chunk)
-
-    # Add all chunks to vectorstore
-    if all_docs:
-        vectorstore.add_documents(all_docs)
-    return all_docs
-
-
 # ---------------- Sidebar Upload ----------------
+
 st.sidebar.header("📤 Upload Documents")
+
 uploaded_files = st.sidebar.file_uploader(
-    "Upload PDF / DOCX / CSV / XLSX",
-    type=["pdf", "docx", "csv", "xlsx"],
+    "Upload PDF / TXT / CSV",
+    type=["pdf", "txt", "csv"],
     accept_multiple_files=True
 )
+
+import nest_asyncio
+nest_asyncio.apply() 
+
 
 if uploaded_files:
     st.session_state.uploaded_docs.clear()
 
-    with st.spinner("Uploading, processing and indexing documents..."):
-        for file in uploaded_files:
-            content = ""
-            if file.type == "application/pdf":
-                reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    content += page.extract_text() or ""
-            else:
-                content = file.getvalue().decode("utf-8", errors="ignore")
+    with st.spinner("LLM is processing documents..."):
 
-            mcp_path = run_async(
-                mcp_client.upload_file(file.name, file.getvalue())
-            )
+        async def upload_all_files():
+            tasks = [process_upload(file, write_file_tool, write_query_tool) for file in uploaded_files]
+            return await asyncio.gather(*tasks)
 
-            run_async(
-                mcp_client.save_metadata({
-                    "filename": file.name,
-                    "upload_date": datetime.now().isoformat(),
-                    "metadata": mcp_path
-                })
-            )
+        uploaded_docs = asyncio.get_event_loop().run_until_complete(upload_all_files())
 
-            st.session_state.uploaded_docs.append({
-                "filename": file.name,
-                "content": content,
-                "mcp_path": mcp_path
-            })
 
-        process_documents_and_add_to_vectorstore(st.session_state.uploaded_docs)
-        st.sidebar.success("✅ Documents uploaded & indexed successfully!")
+        st.session_state.uploaded_docs.extend(uploaded_docs)
+
+
+        processor = TextProcessor(chunk_size=500, chunk_overlap=50)
+        docs = []
+        for doc in st.session_state.uploaded_docs:
+            doc_chunks = processor.process(doc["content"], doc["filename"])
+            docs.extend(doc_chunks)
+        vectorstore.add_documents(docs)
+
+        st.sidebar.success("✅ Documents uploaded & indexed")
 
 
 # ---------------- Chat Section ----------------
-st.header("💬 Ask questions from your documents")
-query = st.text_input("Ask a question:")
 
-if query and query.strip():
+st.header("💬 Ask questions from your documents")
+
+query = st.text_input("Ask a question")
+
+if query:
     if not st.session_state.uploaded_docs:
         st.warning("Please upload documents first.")
     else:
-        with st.spinner("Searching documents..."):
-            # Retrieve top 3 most relevant chunks from vectorstore
-            top_docs = vectorstore.similarity_search(query, k=3)
+        with st.spinner("Thinking..."):
+            # Check if user query mentions a specific uploaded file
+            matched_file = None
+            for doc in st.session_state.uploaded_docs:
+                if doc["filename"] in query:
+                    matched_file = doc["filename"]
+                    break
 
-            # Assemble context for LLM
-            context = "\n\n".join(
-                f"[Source: {r.metadata.get('filename', 'Unknown')}]\n{r.page_content}"
-                for r in top_docs
-            )
+            if matched_file:
+                
+                doc_content = next(
+                    (d["content"] for d in st.session_state.uploaded_docs if d["filename"] == matched_file),
+                    ""
+                )
+                processor = TextProcessor(chunk_size=500, chunk_overlap=50)
+                doc_chunks = processor.process(doc_content, matched_file)
 
-            # Generate answer
-            answer = llm.generate_answer(query, context)
+                top_chunks = doc_chunks[:3]
+
+                # Generate answer using the LLMManager
+                answer = llm_manager.generate_answer(
+                    query,  
+                    top_chunks  
+                )
+                top_docs = doc_chunks  
+            else:
+                # General similarity search across all documents
+                top_docs = vectorstore.similarity_search(query, k=3)
+                answer = llm_manager.generate_answer(
+                    query,
+                    top_docs
+                )
 
         st.subheader("Answer")
-        st.markdown(f"💡 **{answer}**")
+        st.markdown(answer)
 
         st.subheader("Sources")
         for doc in top_docs:
             st.markdown(f"- **{doc.metadata.get('filename', 'unknown')}**")
-else:
-    st.info("📤 Upload documents and ask a question to get started.")
