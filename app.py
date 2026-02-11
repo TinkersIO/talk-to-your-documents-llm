@@ -2,14 +2,17 @@ import os
 import asyncio
 from datetime import datetime
 import base64
+from langchain_groq import ChatGroq
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain_core.tools import Tool
-from mcp_client import load_mcp_tools, upload_file_via_mcp, save_metadata_via_mcp
+from mcp_client import MCPClient
+from mcp_client import upload_file_via_mcp, save_metadata_via_mcp
 from llm import LLMManager
 from vectorstore import VectorStore
 from textprocessing import TextProcessor
+from langchain.agents import create_agent
 
 load_dotenv(override=True)
 
@@ -38,12 +41,17 @@ async def process_upload(file, write_tool: Tool, sql_tool: Tool):
 st.set_page_config(page_title="📄 Talk To My Docs", layout="wide")
 st.title("📄 Talk to Your Documents")
 
+# ---------------- MCP Setup ----------------
+mcp_client = MCPClient()
+mcp_tools = asyncio.run(mcp_client.get_tools())
+
+
 vectorstore = VectorStore()
 llm_manager = LLMManager()
 
-# ---------------- MCP Setup ----------------
 
-mcp_client, mcp_tools = load_mcp_tools()
+
+
 
 write_file_tool = next((t for t in mcp_tools if t.name == "write_file"), None)
 read_file_tool = next((t for t in mcp_tools if t.name == "read_file"), None)
@@ -97,8 +105,9 @@ if uploaded_files:
         st.sidebar.success("✅ Documents uploaded & indexed")
 
 
-# ---------------- Chat Section ----------------
+# # ---------------- Chat Section ----------------
 
+# ---------------- Chat Section ----------------
 st.header("💬 Ask questions from your documents")
 
 query = st.text_input("Ask a question")
@@ -108,37 +117,17 @@ if query:
         st.warning("Please upload documents first.")
     else:
         with st.spinner("Thinking..."):
-            # Check if user query mentions a specific uploaded file
-            matched_file = None
+            # Prepare top document chunks (for LLM fallback)
+            processor = TextProcessor(chunk_size=500, chunk_overlap=50)
+            all_chunks = []
             for doc in st.session_state.uploaded_docs:
-                if doc["filename"] in query:
-                    matched_file = doc["filename"]
-                    break
+                doc_chunks = processor.process(doc["content"], doc["filename"])
+                all_chunks.extend(doc_chunks)
 
-            if matched_file:
-                
-                doc_content = next(
-                    (d["content"] for d in st.session_state.uploaded_docs if d["filename"] == matched_file),
-                    ""
-                )
-                processor = TextProcessor(chunk_size=500, chunk_overlap=50)
-                doc_chunks = processor.process(doc_content, matched_file)
+            top_docs = all_chunks[:3]  
 
-                top_chunks = doc_chunks[:3]
-
-                # Generate answer using the LLMManager
-                answer = llm_manager.generate_answer(
-                    query,  
-                    top_chunks  
-                )
-                top_docs = doc_chunks  
-            else:
-                # General similarity search across all documents
-                top_docs = vectorstore.similarity_search(query, k=3)
-                answer = llm_manager.generate_answer(
-                    query,
-                    top_docs
-                )
+            # Call LLMManager's generate_answer (will use agent if exists)
+            answer = llm_manager.generate_answer(query, top_docs)
 
         st.subheader("Answer")
         st.markdown(answer)
