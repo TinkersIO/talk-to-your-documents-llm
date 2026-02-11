@@ -105,7 +105,6 @@ if uploaded_files:
         st.sidebar.success("✅ Documents uploaded & indexed")
 
 
-# # ---------------- Chat Section ----------------
 
 # ---------------- Chat Section ----------------
 st.header("💬 Ask questions from your documents")
@@ -117,7 +116,7 @@ if query:
         st.warning("Please upload documents first.")
     else:
         with st.spinner("Thinking..."):
-            # Prepare top document chunks (for LLM fallback)
+           
             processor = TextProcessor(chunk_size=500, chunk_overlap=50)
             all_chunks = []
             for doc in st.session_state.uploaded_docs:
@@ -126,7 +125,7 @@ if query:
 
             top_docs = all_chunks[:3]  
 
-            # Call LLMManager's generate_answer (will use agent if exists)
+            
             answer = llm_manager.generate_answer(query, top_docs)
 
         st.subheader("Answer")

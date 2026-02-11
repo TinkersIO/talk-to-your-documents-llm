@@ -62,22 +62,22 @@ class LLMManager:
     - Otherwise, use the raw LLM on the provided documents.
     """
 
-    # If agent exists, delegate to agent (documents not needed)
+    
         if self.agent:
             response = self.agent.run(query)
-            return response.strip()  # agent returns string
+            return response.strip() 
 
-    # If no documents, return fallback
+
         if not documents:
             return "I don't know"
 
-    # Convert documents to text
+   
         docs_text = "\n\n".join(
             doc.page_content if hasattr(doc, "page_content") else str(doc)
             for doc in documents
         )
 
-    # Create prompt
+   
         answer_prompt = ChatPromptTemplate.from_template("""
     You are a helpful assistant.
     Answer the question using ONLY the provided context.
