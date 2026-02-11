@@ -54,28 +54,15 @@ class LLMManager:
         return [query] + expanded_queries
 
     # ---------------- Answer Generation ----------------
-    def generate_answer(self, query: str, documents=None):
-        """
-        Generate an answer for the given query.
-
-    - If an agent is initialized, use the agent.
-    - Otherwise, use the raw LLM on the provided documents.
-    """
-
-    
-        if self.agent:
-            response = self.agent.run(query)
-            return response.strip() 
-
-
+    async def generate_answer(self, query: str, documents):
         if not documents:
             return "I don't know"
 
-   
         docs_text = "\n\n".join(
-            doc.page_content if hasattr(doc, "page_content") else str(doc)
-            for doc in documents
-        )
+        doc.page_content if hasattr(doc, "page_content") else str(doc)
+        for doc in documents
+    )
+       
 
    
         answer_prompt = ChatPromptTemplate.from_template("""
@@ -95,7 +82,22 @@ class LLMManager:
         context=docs_text,
         input=query
     )
+        
+        if self.agent:
+            try:
+                print(" Using Agent...")
+                
+                agent_input = {"file_path": documents[0].metadata.get("path")}
+                response =await self.agent.ainvoke(agent_input)
+                if response:
+                    return str(response)
 
-    # Use raw LLM
-        response = self.llm.invoke(prompt_text)
+            except Exception as e:
+                print(" Agent failed:", e)
+
+   
+        
+        response =await self.llm.ainvoke(prompt_text)
         return response.content.strip()
+
+    

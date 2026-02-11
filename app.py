@@ -16,6 +16,8 @@ from langchain.agents import create_agent
 
 load_dotenv(override=True)
 
+
+
 # ---------------- Helpers ----------------
 
 def extract_text_from_pdf(file) -> str:
@@ -47,7 +49,7 @@ mcp_tools = asyncio.run(mcp_client.get_tools())
 
 
 vectorstore = VectorStore()
-llm_manager = LLMManager()
+llm_manager = LLMManager(tools=mcp_tools)
 
 
 
@@ -67,7 +69,6 @@ if "uploaded_docs" not in st.session_state:
     st.session_state.uploaded_docs = []
 
 # ---------------- Sidebar Upload ----------------
-
 st.sidebar.header("📤 Upload Documents")
 
 uploaded_files = st.sidebar.file_uploader(
@@ -76,25 +77,49 @@ uploaded_files = st.sidebar.file_uploader(
     accept_multiple_files=True
 )
 
-import nest_asyncio
-nest_asyncio.apply() 
 
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+import nest_asyncio
+nest_asyncio.apply()
 
 if uploaded_files:
     st.session_state.uploaded_docs.clear()
 
-    with st.spinner("LLM is processing documents..."):
+    with st.spinner("Processing documents..."):
 
-        async def upload_all_files():
-            tasks = [process_upload(file, write_file_tool, write_query_tool) for file in uploaded_files]
-            return await asyncio.gather(*tasks)
+        uploaded_docs = []
 
-        uploaded_docs = asyncio.get_event_loop().run_until_complete(upload_all_files())
+        for file in uploaded_files:
+            # Save file to uploads folder
+            file_path = os.path.join(UPLOAD_DIR, file.name)
+            with open(file_path, "wb") as f:
+                f.write(file.getvalue())
 
+            # Extract text from file
+            if file.type == "application/pdf":
+                content = extract_text_from_pdf(file_path)
+            else:
+                content = file.getvalue().decode("utf-8", errors="ignore")
+
+            # Upload via MCP (async)
+            async def upload_file_task(file_name, file_content):
+                await upload_file_via_mcp(write_file_tool, file_name, file_content.encode("utf-8"))
+                await save_metadata_via_mcp(write_query_tool, file_name, "User uploaded")
+
+            asyncio.get_event_loop().run_until_complete(upload_file_task(file.name, content))
+
+            # Add to session state
+            uploaded_docs.append({
+                "filename": file.name,
+                "content": content,
+                "path": file_path
+            })
 
         st.session_state.uploaded_docs.extend(uploaded_docs)
 
-
+        # Chunk documents and add to vectorstore
         processor = TextProcessor(chunk_size=500, chunk_overlap=50)
         docs = []
         for doc in st.session_state.uploaded_docs:
@@ -102,10 +127,12 @@ if uploaded_files:
             docs.extend(doc_chunks)
         vectorstore.add_documents(docs)
 
-        st.sidebar.success("✅ Documents uploaded & indexed")
+        st.sidebar.success("✅ Documents uploaded, saved & indexed")
 
 
-
+import asyncio
+import nest_asyncio
+nest_asyncio.apply() 
 # ---------------- Chat Section ----------------
 st.header("💬 Ask questions from your documents")
 
@@ -117,20 +144,37 @@ if query:
     else:
         with st.spinner("Thinking..."):
            
-            processor = TextProcessor(chunk_size=500, chunk_overlap=50)
-            all_chunks = []
-            for doc in st.session_state.uploaded_docs:
-                doc_chunks = processor.process(doc["content"], doc["filename"])
-                all_chunks.extend(doc_chunks)
+            matched_file = next(
+                (d["filename"] for d in st.session_state.uploaded_docs if d["filename"] in query),
+                None
+            )
 
-            top_docs = all_chunks[:3]  
+            if matched_file:
+               
+                doc_content = next(
+                    (d["content"] for d in st.session_state.uploaded_docs if d["filename"] == matched_file),
+                    ""
+                )
+                processor = TextProcessor(chunk_size=500, chunk_overlap=50)
+                doc_chunks = processor.process(doc_content, matched_file)
+                top_chunks = [c for c in doc_chunks if c.page_content.strip()][:3]
+            else:
+                
+                top_chunks = vectorstore.similarity_search(query, k=3)
 
             
-            answer = llm_manager.generate_answer(query, top_docs)
+            if not top_chunks:
+                answer = "I don't know"
+            else:
+                
+                answer = asyncio.get_event_loop().run_until_complete(
+                    llm_manager.generate_answer(query, top_chunks)
+                )
 
+        
         st.subheader("Answer")
         st.markdown(answer)
 
         st.subheader("Sources")
-        for doc in top_docs:
+        for doc in top_chunks:
             st.markdown(f"- **{doc.metadata.get('filename', 'unknown')}**")
