@@ -2,6 +2,7 @@ import os
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
 from langchain_core.tools import Tool
+from vectorstore import vectorstore
 from langchain_classic.chains import LLMChain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.chains.combine_documents.stuff import create_stuff_documents_chain
@@ -12,13 +13,17 @@ class LLMManager:
         self.llm = ChatGroq (
             model="llama-3.1-8b-instant",
             temperature=0,
-            max_tokens=1000,
+            max_tokens=500,
             timeout=30
             )
         
+        self.vectorstore = vectorstore
+        
         self.agent=None
+        safe_tools = []
         if tools:
-            self.agent = create_agent(self.llm, tools=tools)
+            safe_tools = [t for t in tools if t.name != "read_file"]
+            self.agent = create_agent(self.llm, tools=safe_tools)
 
           
 
@@ -58,46 +63,59 @@ class LLMManager:
         if not documents:
             return "I don't know"
 
-        docs_text = "\n\n".join(
-        doc.page_content if hasattr(doc, "page_content") else str(doc)
-        for doc in documents
-    )
-       
+    # ---------------- Prepare text ----------------
+        MAX_CHARS = 2000  
+        CHUNK_OVERLAP = 200
+        all_chunks = []
 
-   
-        answer_prompt = ChatPromptTemplate.from_template("""
-    You are a helpful assistant.
-    Answer the question using ONLY the provided context.
-    If the context partially answers the question, summarize it.
-    Keep your answer concise, in 5-6 lines.
-    If the context does not contain the answer, say "I don't know".
+        for doc in documents[:3]:  # only top 3 chunks
+            text = doc.page_content if hasattr(doc, "page_content") else str(doc)
+            start = 0
+            while start < len(text):
+                end = min(start + MAX_CHARS, len(text))
+                all_chunks.append(text[start:end])
+                start = end - CHUNK_OVERLAP  # overlap
 
-    Context:
-    {context}
+        docs_text = "\n\n".join(all_chunks)
 
-    Question: {input}
-    """)
+    # ---------------- Construct prompt ----------------
+        answer_prompt = f"""
+You are a helpful assistant.
+Answer the question using ONLY the provided context.
+If the context partially answers the question, summarize it.
+Keep your answer concise, in 5-6 lines.
+If the context does not contain the answer, say "I don't know".
 
-        prompt_text = answer_prompt.format(
-        context=docs_text,
-        input=query
-    )
-        
+Context:
+{docs_text}
+
+Question: {query}
+"""
+
+    # ---------------- Use Agent if available ----------------
         if self.agent:
             try:
                 print(" Using Agent...")
-                
-                agent_input = {"file_path": documents[0].metadata.get("path")}
-                response =await self.agent.ainvoke(agent_input)
-                if response:
-                    return str(response)
+                agent_input = {"messages": [{"role": "user", "content": answer_prompt}]}
+                response = await self.agent.ainvoke(agent_input)
+
+            # If agent returns structured messages
+                if isinstance(response, dict) and "messages" in response:
+                    human_msg = next(
+                    (m for m in response["messages"] if m._class.name_ == "HumanMessage"),
+                    None
+                )
+                    if human_msg:
+                        msg_text = getattr(human_msg, "content", None) or getattr(human_msg, "text", "")
+                        return msg_text.strip() if isinstance(msg_text, str) else str(msg_text).strip()
+
+            # If agent returns plain string
+                if isinstance(response, str):
+                    return response.strip()
 
             except Exception as e:
                 print(" Agent failed:", e)
 
-   
-        
-        response =await self.llm.ainvoke(prompt_text)
+    # ---------------- Fallback: direct LLM call ----------------
+        response = await self.llm.ainvoke(answer_prompt)
         return response.content.strip()
-
-    

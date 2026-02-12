@@ -10,7 +10,7 @@ from langchain_core.tools import Tool
 from mcp_client import MCPClient
 from mcp_client import upload_file_via_mcp, save_metadata_via_mcp
 from llm import LLMManager
-from vectorstore import VectorStore
+from vectorstore import vectorstore
 from textprocessing import TextProcessor
 from langchain.agents import create_agent
 
@@ -48,12 +48,8 @@ mcp_client = MCPClient()
 mcp_tools = asyncio.run(mcp_client.get_tools())
 
 
-vectorstore = VectorStore()
-llm_manager = LLMManager(tools=mcp_tools)
-
-
-
-
+vectorstore = vectorstore()
+llm_manager = LLMManager()
 
 write_file_tool = next((t for t in mcp_tools if t.name == "write_file"), None)
 read_file_tool = next((t for t in mcp_tools if t.name == "read_file"), None)
@@ -120,7 +116,7 @@ if uploaded_files:
         st.session_state.uploaded_docs.extend(uploaded_docs)
 
         # Chunk documents and add to vectorstore
-        processor = TextProcessor(chunk_size=500, chunk_overlap=50)
+        processor = TextProcessor(chunk_size=1000, chunk_overlap=100)
         docs = []
         for doc in st.session_state.uploaded_docs:
             doc_chunks = processor.process(doc["content"], doc["filename"])
@@ -143,38 +139,60 @@ if query:
         st.warning("Please upload documents first.")
     else:
         with st.spinner("Thinking..."):
-           
-            matched_file = next(
-                (d["filename"] for d in st.session_state.uploaded_docs if d["filename"] in query),
-                None
-            )
 
-            if matched_file:
-               
-                doc_content = next(
-                    (d["content"] for d in st.session_state.uploaded_docs if d["filename"] == matched_file),
-                    ""
-                )
-                processor = TextProcessor(chunk_size=500, chunk_overlap=50)
-                doc_chunks = processor.process(doc_content, matched_file)
-                top_chunks = [c for c in doc_chunks if c.page_content.strip()][:3]
-            else:
-                
-                top_chunks = vectorstore.similarity_search(query, k=3)
+            processor = TextProcessor(chunk_size=1000, chunk_overlap=100)
+            top_chunks = []
 
             
-            if not top_chunks:
-                answer = "I don't know"
-            else:
+            if "summary" in query.lower():
                 
+                doc = st.session_state.uploaded_docs[0]
+                full_text = doc["content"]
+
+                
+                doc_obj = type("Doc", (), {"page_content": full_text})
                 answer = asyncio.get_event_loop().run_until_complete(
-                    llm_manager.generate_answer(query, top_chunks)
+                    llm_manager.generate_answer(query, [doc_obj])
                 )
 
-        
+                top_chunks = [type("Doc", (), {"metadata": {"filename": doc["filename"]}})]
+
+            
+            else:
+               
+                matched_file = next(
+                    (d["filename"] for d in st.session_state.uploaded_docs if d["filename"] in query),
+                    None
+                )
+
+                if matched_file:
+                  
+                    doc_content = next(
+                        (d["content"] for d in st.session_state.uploaded_docs if d["filename"] == matched_file),
+                        ""
+                    )
+                    doc_chunks = processor.process(doc_content, matched_file)
+                    top_chunks = [c for c in doc_chunks if c.page_content.strip()][:3]
+                else:
+                    
+                    top_chunks = vectorstore.similarity_search(query, k=3)
+
+              
+                if not top_chunks:
+                    answer = "I don't know"
+                else:
+                    answer = asyncio.get_event_loop().run_until_complete(
+                        llm_manager.generate_answer(query, top_chunks)
+                    )
+
+        # ---------------- Display the Answer ----------------
         st.subheader("Answer")
         st.markdown(answer)
 
+        # ---------------- Display Sources ----------------
         st.subheader("Sources")
         for doc in top_chunks:
-            st.markdown(f"- **{doc.metadata.get('filename', 'unknown')}**")
+            if hasattr(doc, "metadata") and doc.metadata:
+                st.markdown(f"- **{doc.metadata.get('filename', 'unknown')}**")
+            else:
+                st.markdown(f"- **unknown**")
