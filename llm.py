@@ -1,121 +1,101 @@
-import os
 from langchain_groq import ChatGroq
-from langchain.agents import create_agent
-from langchain_core.tools import Tool
-from vectorstore import vectorstore
-from langchain_classic.chains import LLMChain
+from langchain_classic.agents import create_tool_calling_agent
+from langchain_classic.agents import AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_classic.chains.combine_documents.stuff import create_stuff_documents_chain
+from langchain_core.tools import Tool
 
 
 class LLMManager:
-    def __init__(self, tools=None):
-        self.llm = ChatGroq (
+    def __init__(self, tools: list[Tool]):
+        # ---------------- LLM ----------------
+        self.llm = ChatGroq(
             model="llama-3.1-8b-instant",
             temperature=0,
-            max_tokens=500,
+            max_tokens=700,
             timeout=30
-            )
-        
-        self.vectorstore = vectorstore
-        
-        self.agent=None
-        safe_tools = []
-        if tools:
-            safe_tools = [t for t in tools if t.name != "read_file"]
-            self.agent = create_agent(self.llm, tools=safe_tools)
+        )
 
-          
+        # ---------------- System Prompt ----------------
+        system_prompt = """
+You are an intelligent document assistant.
 
+You have access to tools that allow you to:
+- Search document chunks
+- Read full documents
+- Query document metadata
 
-    # ---------------- Query Expansion ----------------
-    def expand_query(self, query: str) -> list[str]:
-        expansion_prompt = ChatPromptTemplate.from_template("""
-        You are expanding a user query to improve document retrieval.
-        Generate EXACTLY 3 alternative search queries.
-        Do NOT number them.
-        Do NOT add bullet points.
-        Each query must be on a new line.
+IMPORTANT TOKEN SAFETY RULES:
 
-        Add:
-        - synonyms
-        - related technical terms
-        - alternative phrasings
+1. Never load or process an entire large document at once.
+2. If a document is large:
+   - Break it into smaller logical sections.
+   - Summarize each section individually.
+   - Then combine the partial summaries into a final summary.
+3. Prefer retrieving only relevant chunks instead of full documents.
+4. Always minimize the amount of text sent to the model.
+5. If content is too large to process safely, summarize progressively.
 
-        Return ONLY the queries.
+TASK RULES:
 
-        User query: {query}
-        """)
+• If the user asks for a summary:
+  → Retrieve the document in manageable parts.
+  → Perform step-by-step summarization.
+  → Return a concise final summary.
 
-        prompt_text = expansion_prompt.format(query=query)
-        response = self.llm.invoke(prompt_text)
+• If the user asks a specific question:
+  → Retrieve only relevant sections.
+  → Answer strictly from retrieved data.
 
-        expanded_queries = [
-            q.strip().lstrip("0123456789.- ")
-            for q in response.content.split("\n")
-            if q.strip()
-        ][:3]
+• If answer cannot be found:
+  → Say "I don't know".
 
-        return [query] + expanded_queries
-
-    # ---------------- Answer Generation ----------------
-    async def generate_answer(self, query: str, documents):
-        if not documents:
-            return "I don't know"
-
-    # ---------------- Prepare text ----------------
-        MAX_CHARS = 2000  
-        CHUNK_OVERLAP = 200
-        all_chunks = []
-
-        for doc in documents[:3]:  # only top 3 chunks
-            text = doc.page_content if hasattr(doc, "page_content") else str(doc)
-            start = 0
-            while start < len(text):
-                end = min(start + MAX_CHARS, len(text))
-                all_chunks.append(text[start:end])
-                start = end - CHUNK_OVERLAP  # overlap
-
-        docs_text = "\n\n".join(all_chunks)
-
-    # ---------------- Construct prompt ----------------
-        answer_prompt = f"""
-You are a helpful assistant.
-Answer the question using ONLY the provided context.
-If the context partially answers the question, summarize it.
-Keep your answer concise, in 5-6 lines.
-If the context does not contain the answer, say "I don't know".
-
-Context:
-{docs_text}
-
-Question: {query}
+Never hallucinate.
+Always respect token limits.
 """
 
-    # ---------------- Use Agent if available ----------------
-        if self.agent:
-            try:
-                print(" Using Agent...")
-                agent_input = {"messages": [{"role": "user", "content": answer_prompt}]}
-                response = await self.agent.ainvoke(agent_input)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}")
+        ])
 
-            # If agent returns structured messages
-                if isinstance(response, dict) and "messages" in response:
-                    human_msg = next(
-                    (m for m in response["messages"] if m._class.name_ == "HumanMessage"),
-                    None
-                )
-                    if human_msg:
-                        msg_text = getattr(human_msg, "content", None) or getattr(human_msg, "text", "")
-                        return msg_text.strip() if isinstance(msg_text, str) else str(msg_text).strip()
+        # ---------------- Agent ----------------
+        self.agent = create_tool_calling_agent(
+            self.llm,
+            tools,
+            prompt
+        )
 
-            # If agent returns plain string
-                if isinstance(response, str):
-                    return response.strip()
+        self.executor = AgentExecutor(
+            agent=self.agent,
+            tools=tools,
+            verbose=True  
+        )
 
-            except Exception as e:
-                print(" Agent failed:", e)
+    # ---------------- Main Answer Function ----------------
+    async def generate_answer(self, query: str, documents: list):
+        if not documents:
+            return "I don't know"
+        MAX_CHARS = 2000
+        context_chunks = []
 
-    # ---------------- Fallback: direct LLM call ----------------
-        response = await self.llm.ainvoke(answer_prompt)
+        for doc in documents:
+            text = doc.page_content
+            for i in range(0, len(text), MAX_CHARS):
+                context_chunks.append(text[i:i+MAX_CHARS])
+
+    
+        context = "\n\n".join(context_chunks[:5])
+        prompt = f"""
+    You are a helpful assistant.
+    Answer the question using ONLY the provided context.
+    If the context does not contain the answer, say "I don't know".
+
+    Context:
+    {context}
+
+    Question: {query}
+    """
+
+        response = await self.llm.ainvoke(prompt)
         return response.content.strip()
