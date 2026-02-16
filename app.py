@@ -4,10 +4,10 @@ import nest_asyncio
 from dotenv import load_dotenv
 import streamlit as st
 from vectorstore import VectorStore
-from mcp_client import MCPClient
-from llm import LLMManager
+from llm import get_agent, get_llm
 from textprocessing import TextProcessor
 from uploads import upload_files
+
 
 # ---------------- Setup ----------------
 load_dotenv(override=True)
@@ -15,24 +15,18 @@ nest_asyncio.apply()
 st.set_page_config(page_title="📄 Talk To My Docs", layout="wide")
 st.title("📄 Talk to Your Documents")
 
-# ---------------- MCP & Tools ----------------
-mcp_client = MCPClient()
-mcp_tools = asyncio.run(mcp_client.get_tools())
+# ---------------- LLM + MCP Agent ----------------
+if "agent" not in st.session_state:
+    st.session_state.agent = asyncio.run(get_agent())
 
-write_file_tool = next((t for t in mcp_tools if t.name == "write_file"), None)
-read_file_tool = next((t for t in mcp_tools if t.name == "read_file"), None)
-write_query_tool = next((t for t in mcp_tools if t.name == "write_query"), None)
+agent = st.session_state.agent
 
-if not all([write_file_tool, read_file_tool, write_query_tool]):
-    st.error("MCP tools not loaded correctly.")
-    st.stop()
 
 # ---------------- LLM & Vectorstore ----------------
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = VectorStore()
 vectorstore = st.session_state.vectorstore
 
-llm = LLMManager(tools=mcp_tools)
 
 # ---------------- Session State ----------------
 if "uploaded_docs" not in st.session_state:
@@ -52,8 +46,6 @@ if uploaded_files:
         
         uploaded_docs = upload_files(
             uploaded_files,
-            write_tool=write_file_tool,
-            sql_tool=write_query_tool,
             upload_dir="./uploads"
         )
         st.session_state.uploaded_docs.extend(uploaded_docs)
@@ -69,10 +61,10 @@ if uploaded_files:
 
 # ---------------- Chat Helpers ----------------
 def get_top_chunks(query):
-    """Return top relevant document chunks based on query."""
+    
     processor = TextProcessor(chunk_size=500, chunk_overlap=50)
 
-    # If user asks for a summary, take full document
+   
     if "summary" in query.lower() and st.session_state.uploaded_docs:
         doc = st.session_state.uploaded_docs[0]
         return [type("Doc", (), {"page_content": doc["content"], "metadata": {"filename": doc["filename"]}})]
@@ -96,13 +88,30 @@ if query:
     else:
         with st.spinner("Thinking..."):
             top_chunks = get_top_chunks(query)
-
             if not top_chunks:
                 answer = "I don't know"
             else:
-                answer = asyncio.get_event_loop().run_until_complete(
-                    llm.generate_answer(query, top_chunks)
-                )
+                context = "\n\n".join(
+                [doc.page_content for doc in top_chunks]
+            )
+            prompt = f"""
+Answer the question ONLY using the context below.
+If it has some content summarize it.
+If the answer is not in the context, say "I don't know".
+
+Context:
+{context}
+
+Question:
+{query}
+"""
+
+                
+            llm = get_llm()
+            
+
+            response = llm.invoke(prompt)
+            answer = response.content
 
         # Display Answer
         st.subheader("Answer")
