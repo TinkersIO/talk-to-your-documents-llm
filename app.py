@@ -1,39 +1,109 @@
 import os
 import asyncio
 import nest_asyncio
-from dotenv import load_dotenv
 import streamlit as st
+from datetime import datetime
+import sqlite3
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.schema import Document
+from llm import LLMManager
+from uploads import FileUpload
 from vectorstore import VectorStore
-from llm import get_agent, get_llm
-from textprocessing import TextProcessor
-from uploads import upload_files
 
+# ---------------- Config ----------------
+UPLOADS_DIR = r"D:\PythonProjects\modular_1\uploads"
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 100
+TOP_K_CHUNKS = 5  # number of chunks to retrieve per query
 
-# ---------------- Setup ----------------
-load_dotenv(override=True)
+# ---------------- Streamlit Setup ----------------
 nest_asyncio.apply()
 st.set_page_config(page_title="📄 Talk To My Docs", layout="wide")
 st.title("📄 Talk to Your Documents")
 
-# ---------------- LLM + MCP Agent ----------------
-if "agent" not in st.session_state:
-    st.session_state.agent = asyncio.run(get_agent())
+# ---------------- LLM Agent ----------------
+async def init_manager():
+    manager = LLMManager()
+    await manager.initialize()  # your agent with MCP tools
+    return manager
 
-agent = st.session_state.agent
+if "agent_manager" not in st.session_state:
+    st.session_state.agent_manager = asyncio.run(init_manager())
 
+agent = st.session_state.agent_manager.get_agent()
 
-# ---------------- LLM & Vectorstore ----------------
+# ---------------- Vectorstore ----------------
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = VectorStore()
 vectorstore = st.session_state.vectorstore
 
+# ---------------- Upload Service ----------------
+if "upload_service" not in st.session_state:
+    st.session_state.upload_service = FileUpload(
+        upload_dir=UPLOADS_DIR,
+        db_path=os.path.join(UPLOADS_DIR, "database.db")
+    )
+upload_service = st.session_state.upload_service
 
-# ---------------- Session State ----------------
-if "uploaded_docs" not in st.session_state:
-    st.session_state.uploaded_docs = []
+if "uploaded_docs_processed" not in st.session_state:
+    st.session_state.uploaded_docs_processed = set()
 
-# ---------------- Sidebar Upload ----------------
-st.sidebar.header("📤 Upload Documents")
+# ---------------- Rebuild Vectorstore from DB ----------------
+def rebuild_vectorstore():
+    conn = sqlite3.connect(upload_service.db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT filename, filepath FROM documents")
+    docs = cur.fetchall()
+    conn.close()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    chunks_to_add = []
+
+    for filename, filepath in docs:
+        # Avoid reprocessing already added files
+        if filename in st.session_state.uploaded_docs_processed:
+            continue
+        content = upload_service._extract_text(filepath)
+        doc_chunks = splitter.split_text(content)
+        for i, chunk in enumerate(doc_chunks):
+            chunks_to_add.append(
+                Document(
+                    page_content=chunk,
+                    metadata={
+                        "filename": filename,
+                        "chunk_index": i,
+                        "upload_date": datetime.now().isoformat()
+                    }
+                )
+            )
+        st.session_state.uploaded_docs_processed.add(filename)
+
+    if chunks_to_add:
+        vectorstore.add_documents(chunks_to_add)
+
+# Rebuild vectorstore on startup
+rebuild_vectorstore()
+
+# ---------------- Sidebar: Document List ----------------
+st.sidebar.header("📂 Your Documents")
+conn = sqlite3.connect(upload_service.db_path)
+cur = conn.cursor()
+cur.execute("SELECT filename, upload_date FROM documents ORDER BY upload_date DESC")
+rows = cur.fetchall()
+conn.close()
+
+if rows:
+    for filename, upload_date in rows:
+        st.sidebar.markdown(f"- **{filename}** | {upload_date}")
+else:
+    st.sidebar.info("Upload any file first!")
+
+# ---------------- Sidebar: File Upload ----------------
+st.sidebar.header("📤 Upload New Documents")
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDF / TXT / CSV",
     type=["pdf", "txt", "csv"],
@@ -41,84 +111,84 @@ uploaded_files = st.sidebar.file_uploader(
 )
 
 if uploaded_files:
-    st.session_state.uploaded_docs.clear()
     with st.spinner("Processing documents..."):
-        
-        uploaded_docs = upload_files(
-            uploaded_files,
-            upload_dir="./uploads"
-        )
-        st.session_state.uploaded_docs.extend(uploaded_docs)
+        new_files = [f for f in uploaded_files if f.name not in st.session_state.uploaded_docs_processed]
 
-     
-        processor = TextProcessor(chunk_size=500, chunk_overlap=50)
-        chunks = []
-        for doc in uploaded_docs:
-            chunks.extend(processor.process(doc["content"], doc["filename"]))
-        vectorstore.add_documents(chunks)
+        if new_files:
+            uploaded_docs = upload_service.upload_files(new_files)
+            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            chunks_to_add = []
 
-        st.sidebar.success("✅ Documents uploaded, saved & indexed")
+            for doc in uploaded_docs:
+                doc_chunks = splitter.split_text(doc["content"])
+                for i, chunk in enumerate(doc_chunks):
+                    chunks_to_add.append(
+                        Document(
+                            page_content=chunk,
+                            metadata={
+                                "filename": doc["filename"],
+                                "chunk_index": i,
+                                "upload_date": datetime.now().isoformat()
+                            }
+                        )
+                    )
+                st.session_state.uploaded_docs_processed.add(doc["filename"])
 
-# ---------------- Chat Helpers ----------------
-def get_top_chunks(query):
-    
-    processor = TextProcessor(chunk_size=500, chunk_overlap=50)
-
-   
-    if "summary" in query.lower() and st.session_state.uploaded_docs:
-        doc = st.session_state.uploaded_docs[0]
-        return [type("Doc", (), {"page_content": doc["content"], "metadata": {"filename": doc["filename"]}})]
-
-   
-    matched_doc = next((d for d in st.session_state.uploaded_docs if d["filename"] in query), None)
-    if matched_doc:
-        chunks = processor.process(matched_doc["content"], matched_doc["filename"])
-        return [c for c in chunks if c.page_content.strip()][:5]
-
- 
-    return vectorstore.similarity_search(query, k=5)
+            vectorstore.add_documents(chunks_to_add)
+            st.success(f"✅ Document chunks added to vectorstore!")
 
 # ---------------- Chat Section ----------------
 st.header("💬 Ask questions from your documents")
-query = st.text_input("Ask a question")
+query = st.text_input("Enter your question here:")
 
-if query:
-    if not st.session_state.uploaded_docs:
+if query and query.strip():
+    if not rows and not uploaded_files:
         st.warning("Please upload documents first.")
     else:
         with st.spinner("Thinking..."):
-            top_chunks = get_top_chunks(query)
-            if not top_chunks:
-                answer = "I don't know"
-            else:
-                context = "\n\n".join(
-                [doc.page_content for doc in top_chunks]
-            )
-            prompt = f"""
-Answer the question ONLY using the context below.
-If it has some content summarize it.
-If the answer is not in the context, say "I don't know".
 
-Context:
-{context}
+            # ---------------- Step 1: Retrieve relevant chunks ----------------
+            relevant_docs = vectorstore.similarity_search(query, k=TOP_K_CHUNKS)
+            context_text = ""
+            for doc in relevant_docs:
+                meta = doc.metadata
+                context_text += f"Filename: {meta.get('filename', 'unknown')}\n"
+                context_text += f"Content:\n{doc.page_content}\n\n"
 
-Question:
-{query}
+            # ---------------- Step 2: Agent tool prompt ----------------
+            tool_prompt = f"""
+You are a knowledge agent with access to MCP tools:
+1. SQLite MCP tool – query document metadata.
+2. Filesystem MCP tool – read document content.
+
+Workflow Rules:
+- Decide which MCP tool to call based on the user question.
+- Retrieve information only via tools, do not hallucinate.
+- Use the following document context from vectorstore if relevant:
+{context_text}
+- Rerank top chunks and summarize only after retrieving content.
+- If information is not found → respond exactly: "I don't know".
+- Always include filename and source path in your answer.
+- Return only the final answer, do not show tool calls.
 """
 
-                
-            llm = get_llm()
-            
+            # ---------------- Step 3: Build agent input ----------------
+            messages = [
+                {"role": "system", "content": tool_prompt},
+                {"role": "user", "content": query}
+            ]
 
-            response = llm.invoke(prompt)
-            answer = response.content
+            # ---------------- Step 4: Call agent ----------------
+            try:
+                result = asyncio.run(agent.ainvoke({"input": messages}))
+                if isinstance(result, dict):
+                    answer = result.get("output", "I don't know")
+                else:
+                    answer = str(result)
+            except Exception as e:
+                answer = f"Error processing query: {e}"
 
-        # Display Answer
         st.subheader("Answer")
         st.markdown(answer)
-
-        # Display Sources
-        st.subheader("Sources")
-        for doc in top_chunks:
-            filename = doc.metadata.get("filename", "unknown") if hasattr(doc, "metadata") and doc.metadata else "unknown"
-            st.markdown(f"- **{filename}**")
+else:
+    st.info("Enter a question to chat with your documents.")

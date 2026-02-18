@@ -1,83 +1,72 @@
 import asyncio
 import atexit
-import base64
-from datetime import datetime
-from typing import List, Tuple
+import os
+from typing import List
+from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.tools import BaseTool, Tool
+from uploads import UPLOADS_DIR
 
-# ---------------- MCP Servers ----------------
-MCP_SERVERS = {
-    "filesystem": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-filesystem", "./uploads"],
-    },
-    "sqlite": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@executeautomation/database-server", "./database.db"],
-    },
-}
+UPLOADS_DIR = r"D:\PythonProjects\modular_1\uploads"
 
-# ---------------- Minimal MCP Client ----------------
 class MCPClient:
-    """Starts MCP servers and exposes tools; LLM decides usage."""
+    """
+    Manages 2 MCP servers:
+    - Filesystem MCP (read files)
+    - SQLite MCP (query metadata)
+    """
+
+    MCP_SERVERS = {
+        "filesystem": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                 str(UPLOADS_DIR),
+            ],
+        },
+        "sqlite": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "@executeautomation/database-server",
+                str(os.path.join(UPLOADS_DIR, "database.db")),
+            ],
+        },
+    }
 
     def __init__(self):
-        self._client = MultiServerMCPClient(MCP_SERVERS)
-        self._tools: List[BaseTool] | None = None
+        self._client = MultiServerMCPClient(self.MCP_SERVERS)
+        self.tools: List[BaseTool] | None = None
 
-    async def get_tools(self) -> List[BaseTool]:
-        if self._tools is None:
-            self._tools = await self._client.get_tools()
-        return self._tools
+        self._register_cleanup()
 
-    async def close(self):
-        await self._client.close()
+    async def initialize(self):
+        """Load tools asynchronously (SAFE for Streamlit)."""
+        self.tools = await self._client.get_tools()
 
-# ---------------- Async Cleanup on Exit ----------------
-def _register_exit_cleanup(client: MCPClient):
-    """Registers client.close() to run when Python exits."""
-    def _cleanup():
-        try:
-            loop = asyncio.get_running_loop()
-            # If an event loop is running, schedule close as a task
-            loop.create_task(client.close())
-        except RuntimeError:
-            # No running loop, safe to use asyncio.run
-            asyncio.run(client.close())
-    atexit.register(_cleanup)
+        if not self.tools:
+            raise RuntimeError("No MCP tools were loaded!")
 
-# ---------------- Sync Loader for Streamlit ----------------
-def load_mcp_tools() -> Tuple[MCPClient, List[BaseTool]]:
-    """Sync wrapper for Streamlit: returns (client, tools)"""
-    return asyncio.run(_load_mcp_tools())
+        print("Loaded MCP tools:")
+        for t in self.tools:
+            print(" -", t.name)
 
-async def _load_mcp_tools() -> Tuple[MCPClient, List[BaseTool]]:
-    client = MCPClient()
-    tools = await client.get_tools()
-    # Register cleanup immediately after client creation
-    _register_exit_cleanup(client)
-    return client, tools
+    def get_tools(self) -> List[BaseTool]:
+        if self.tools is None:
+            raise RuntimeError("MCPClient not initialized. Call initialize() first.")
+        return self.tools
 
-# ---------------- MCP Helper Functions ----------------
-async def upload_file_via_mcp(write_tool: Tool, filename: str, content: bytes) -> str:
-    """Uploads file to MCP filesystem safely."""
-    encoded = base64.b64encode(content).decode("utf-8")
-    path = f"uploads/{filename}"
-    await write_tool.arun({
-        "path": path,
-        "content": encoded,
-        "encoding": "base64"
-    })
-    return path
+    def _register_cleanup(self):
+        async def cleanup():
+            await self._client.close()
 
-async def save_metadata_via_mcp(sql_tool: Tool, filename: str, metadata: str):
-    """Saves metadata to MCP SQLite safely."""
-    upload_date = datetime.utcnow().isoformat()
-    sql = f"""
-    INSERT INTO documents (filename, upload_date, metadata)
-    VALUES ('{filename}', '{upload_date}', '{metadata}');
-    """
-    await sql_tool.arun({"query": sql})
+        def sync_cleanup():
+            try:
+                asyncio.run(cleanup())
+            except RuntimeError:
+                pass
+
+        atexit.register(sync_cleanup)
+
